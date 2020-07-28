@@ -89,16 +89,17 @@ def fun(c):
 def read_examples(input_file, is_training):
     df = pd.read_csv(input_file)
     examples = []
-    if 'reward' not in df.columns: df['reward'] = '[1.0,1.0,1.0]'
+    if 'reward' not in df.columns: df['reward'] = '[1.0, 1.0, 1.0]'
     def_weight = [1.0, 1.0, 1.0]
+    use_sr = False
     for val in df[['id', 'new_content', 'title', 'label', 'weight', 'reward']].values:
         val[3] = int(val[3]) - 1
         action = list(map(float, val[5][1:-1].split(',')))
 
         reward = 1.0  # 0-th episode
-        if is_training:
-            factor = 0.8
-            reward = reward * factor + action[val[3]] * (1 - factor)  # # 1-th episode
+        if is_training and use_sr:
+            factor = 0.8  # [0.4, 0.6, 0.8]
+            reward = reward * factor + action[val[3]] * (1 - factor)  # 1-th episode
 
         tmp = str(val[1]).split('|')
         title_len = len(val[2])
