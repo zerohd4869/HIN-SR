@@ -16,7 +16,7 @@ tqdm  == 4.40.0     <br>
   ### Training/Testing
 
   ```
-  bash run_bert_reviews_toys.sh
+  bash run_sa_reviews_toys.sh
   ```
   
   
