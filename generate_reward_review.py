@@ -1,56 +1,33 @@
-# coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""BERT finetuning runner."""
-
 from __future__ import absolute_import
 
-import jieba
-from gensim import corpora,models, similarities
-from gensim.models.word2vec import LineSentence, Word2Vec
-
 import argparse
-import csv
+import gc
 import logging
 import os
 import random
-import sys
 from io import open
-import pandas as pd
+from itertools import cycle
+
 import numpy as np
+import pandas as pd
 import torch
-import gc
+from sklearn.metrics import f1_score, recall_score, precision_score
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm, trange
-from sklearn.metrics import f1_score, accuracy_score, recall_score, precision_score
-import json
-from pytorch_transformers.modeling_bert import BertForSequenceClassification, BertConfig
-from pytorch_transformers import AdamW, WarmupLinearSchedule
-from pytorch_transformers.tokenization_bert import BertTokenizer
-from itertools import cycle
-#os.environ["TF_CPP_MIN_LOG_LEVEL"]='3'
+from tqdm import tqdm
 
-logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                    datefmt = '%m/%d/%Y %H:%M:%S',
-                    level = logging.INFO)#ERROR
+from pytorch_transformers import AdamW, WarmupLinearSchedule
+from pytorch_transformers.modeling_bert import BertForSequenceClassification, BertConfig
+from pytorch_transformers.tokenization_bert import BertTokenizer
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                    datefmt='%m/%d/%Y %H:%M:%S',
+                    level=logging.INFO)  # ERROR
 MODEL_CLASSES = {
     'bert': (BertConfig, BertForSequenceClassification, BertTokenizer),
 }
-ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in ( BertConfig,)), ())
+ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig,)), ())
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +35,7 @@ logger = logging.getLogger(__name__)
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
 
-    def __init__(self, guid, text_a, text_b=None, label=None,weight = None, title_len =None):
+    def __init__(self, guid, text_a, text_b=None, label=None, weight=None, title_len=None):
         """Constructs a InputExample.
 
         Args:
@@ -77,13 +54,14 @@ class InputExample(object):
         self.weight = weight
         self.title_len = title_len
 
+
 class InputFeatures(object):
     def __init__(self,
                  example_id,
                  choices_features,
                  label, weight, title_len
 
-    ):
+                 ):
         self.example_id = example_id
         self.choices_features = [
             {
@@ -96,43 +74,41 @@ class InputFeatures(object):
         self.label = label
         self.weight = weight
         self.title_len = title_len
-def fun(c):
-     c = c.replace('[','').replace(']','').replace('\'','').replace(' ','')
-     res = []
-     for i in c.split(','):
-         res.append(float(i))
-     return res
-        
-def read_examples(input_file, is_training):
-    df=pd.read_csv(input_file)
-    examples=[]
-    num = 0
-    for val in df[['id','new_content','title','label','weight']].values:
-        w='[1,1,1]'
-        val[3] = val[3]-1.0
 
+
+def fun(c):
+    c = c.replace('[', '').replace(']', '').replace('\'', '').replace(' ', '')
+    res = []
+    for i in c.split(','):
+        res.append(float(i))
+    return res
+
+
+def read_examples(input_file, is_training):
+    df = pd.read_csv(input_file)
+    examples = []
+    def_weight = [1.0, 1.0, 1.0]
+    for val in df[['id', 'new_content', 'title', 'label', 'weight']].values:
+        val[3] = val[3] - 1.0
         tmp = str(val[1]).split('|')
         title_len = len(val[2])
-        examples.append(InputExample(guid=val[0],text_a= tmp ,text_b=str(val[2]),label=val[3], weight = [float(x) for x in w[1:-1].split(',')], title_len=title_len))
- 
-        num += 1
-        #if num > 10:
-        #    break
-
+        examples.append(InputExample(guid=val[0], text_a=tmp, text_b=str(val[2]), label=val[3], weight=def_weight, title_len=title_len))
     return examples
+
 
 def cut(text, k):
     # cut for k segments.
-    max_len = int(len(text)/k)
+    max_len = int(len(text) / k)
     texts = []
     for i in range(k):
-        if i == k-1:
-            texts.append(text[max_len*i:])
+        if i == k - 1:
+            texts.append(text[max_len * i:])
         else:
-            texts.append(text[i*max_len:(i+1)*max_len])
+            texts.append(text[i * max_len:(i + 1) * max_len])
     return texts
 
-def convert_examples_to_features(examples, tokenizer, max_seq_length,split_num,
+
+def convert_examples_to_features(examples, tokenizer, max_seq_length, split_num,
                                  is_training):
     """Loads a data file into a list of `InputBatch`s."""
 
@@ -152,27 +128,22 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,split_num,
     # The model will output a single value for each input. To get the
     # final decision of the model, we will run a softmax over these 4
     # outputs.
+    global label, weight, title_len
     features = []
     for example_index, example in enumerate(examples):
         context_tokens = []
         for i in range(split_num):
-    #        print(example.text_a[i])
             context_tokens.append(tokenizer.tokenize(example.text_a[i]))
-        #context_tokens=tokenizer.tokenize(example.text_a)
-        ending_tokens=tokenizer.tokenize(example.text_b)
-        
 
-        skip_len=len(context_tokens)/split_num  
+        ending_tokens = tokenizer.tokenize(example.text_b)
         choices_features = []
         for i in range(split_num):
-            context_tokens_choice=context_tokens[i] #context_tokens[int(i*skip_len):int((i+1)*skip_len)]   
+            context_tokens_choice = context_tokens[i]
             _truncate_seq_pair(context_tokens_choice, ending_tokens, max_seq_length - 3)
-            #ending_tokens,context_tokens_choice = context_tokens_choice,ending_tokens
-            tokens = ["[CLS]"]+ ending_tokens + ["[SEP]"] +context_tokens_choice  + ["[SEP]"]
+            tokens = ["[CLS]"] + ending_tokens + ["[SEP]"] + context_tokens_choice + ["[SEP]"]
             segment_ids = [0] * (len(ending_tokens) + 2) + [1] * (len(context_tokens_choice) + 1)
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             input_mask = [1] * len(input_ids)
-
 
             padding_length = max_seq_length - len(input_ids)
             input_ids += ([0] * padding_length)
@@ -180,17 +151,14 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,split_num,
             segment_ids += ([0] * padding_length)
             choices_features.append((tokens, input_ids, input_mask, segment_ids))
 
-
             label = example.label
-            #print(type(example.weight))
             weight = torch.tensor(example.weight)
             title_len = torch.tensor(example.title_len)
-            #print(weight.size())
             if example_index < 1 and is_training:
                 logger.info("*** Example ***")
                 logger.info("idx: {}".format(example_index))
                 logger.info("guid: {}".format(example.guid))
-                logger.info("tokens: {}".format(' '.join(tokens).replace('\u2581','_')))
+                logger.info("tokens: {}".format(' '.join(tokens).replace('\u2581', '_')))
                 logger.info("input_ids: {}".format(' '.join(map(str, input_ids))))
                 logger.info("input_mask: {}".format(' '.join(map(str, input_mask))))
                 logger.info("segment_ids: {}".format(' '.join(map(str, segment_ids))))
@@ -203,8 +171,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,split_num,
                 example_id=example.guid,
                 choices_features=choices_features,
                 label=label,
-                weight = weight,
-                title_len = title_len
+                weight=weight,
+                title_len=title_len
             )
         )
     return features
@@ -217,7 +185,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     # one token at a time. This makes more sense than truncating an equal percent
     # of tokens from each, since if one sequence is very short then each token
     # that's truncated likely contains more information than a longer sequence.
-    
+
     while True:
         total_length = len(tokens_a) + len(tokens_b)
         if total_length <= max_length:
@@ -227,21 +195,26 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
         else:
             tokens_b.pop()
 
+
 def f1(out, labels):
     outputs = np.argmax(out, axis=1)
-    return f1_score(labels,outputs,labels=[0,1,2],average='macro')
-
+    return f1_score(labels, outputs, labels=[0, 1, 2], average='macro')
 
 
 def acc(out, labels):
     outputs = np.argmax(out, axis=1)
-    return (outputs == labels).mean() #accuracy_score(labels,outputs)
+    return (outputs == labels).mean()  # accuracy_score(labels,outputs)
+
+
 def precision(out, labels):
     outputs = np.argmax(out, axis=1)
-    return precision_score(labels,outputs,labels=[0,1,2],average='macro')
-def recall(out,labels):
+    return precision_score(labels, outputs, labels=[0, 1, 2], average='macro')
+
+
+def recall(out, labels):
     outputs = np.argmax(out, axis=1)
-    return recall_score(labels,outputs, labels = [0,1,2],average = 'macro')
+    return recall_score(labels, outputs, labels=[0, 1, 2], average='macro')
+
 
 def select_field(features, field):
     return [
@@ -252,14 +225,15 @@ def select_field(features, field):
         for feature in features
     ]
 
+
 def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
-        
-        
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -323,8 +297,8 @@ def main():
     parser.add_argument("--lstm_layers", default=2, type=int,
                         help="")
     parser.add_argument("--lstm_dropout", default=0.5, type=float,
-                        help="")    
-    
+                        help="")
+
     parser.add_argument("--train_steps", default=-1, type=int,
                         help="")
     parser.add_argument("--report_steps", default=-1, type=int,
@@ -358,8 +332,6 @@ def main():
     parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
     args = parser.parse_args()
-    
-    
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
@@ -371,35 +343,29 @@ def main():
         torch.distributed.init_process_group(backend='nccl')
         args.n_gpu = 1
     args.device = device
-    
-    
+
     # Setup logging
-    logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt = '%m/%d/%Y %H:%M:%S',
-                        level = logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                        datefmt='%m/%d/%Y %H:%M:%S',
+                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-                    args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
-    
+                   args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+
     # Set seed
     set_seed(args)
-
 
     try:
         os.makedirs(args.output_dir)
     except:
         pass
-    
+
     tokenizer = BertTokenizer.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
-    
-    
-    
+
     config = BertConfig.from_pretrained(args.model_name_or_path, num_labels=3)
-    config.output_hidden_states = True    
+    config.output_hidden_states = True
     # Prepare model
-    model = BertForSequenceClassification.from_pretrained(args.model_name_or_path,args,config=config)
+    model = BertForSequenceClassification.from_pretrained(args.model_name_or_path, args, config=config)
 
-
-        
     if args.fp16:
         model.half()
     model.to(device)
@@ -418,30 +384,27 @@ def main():
 
         # Prepare data loader
 
-        train_examples = read_examples(os.path.join(args.data_dir, 'train.csv'), is_training = True)
+        train_examples = read_examples(os.path.join(args.data_dir, 'train.csv'), is_training=True)
         train_features = convert_examples_to_features(
-            train_examples, tokenizer, args.max_seq_length,args.split_num, True)
+            train_examples, tokenizer, args.max_seq_length, args.split_num, True)
         all_input_ids = torch.tensor(select_field(train_features, 'input_ids'), dtype=torch.long)
         all_input_mask = torch.tensor(select_field(train_features, 'input_mask'), dtype=torch.long)
         all_segment_ids = torch.tensor(select_field(train_features, 'segment_ids'), dtype=torch.long)
         all_label = torch.tensor([f.label for f in train_features], dtype=torch.long)
-        for i,f in enumerate(train_features):
-            if i==0:
+        for i, f in enumerate(train_features):
+            if i == 0:
                 all_weight = f.weight.unsqueeze(0)
             else:
                 all_weight = torch.cat([all_weight, f.weight.unsqueeze(0)])
-        #print(all_weight.size())
 
-#        all_weight = torch.tensor([f.weight for f in train_features], dtype= torch.long)
         train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label, all_weight)
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
             train_sampler = DistributedSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size//args.gradient_accumulation_steps)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size // args.gradient_accumulation_steps)
 
-        num_train_optimization_steps =  args.train_steps
-
+        num_train_optimization_steps = args.train_steps
 
         # Prepare optimizer
 
@@ -455,46 +418,46 @@ def main():
         optimizer_grouped_parameters = [
             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
             {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-            ]
+        ]
 
         optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
         scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=args.train_steps)
-        
+
         global_step = 0
 
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_optimization_steps)
-        
-        best_acc=0
+
+        best_acc = 0
         model.train()
         tr_loss = 0
-        nb_tr_examples, nb_tr_steps = 0, 0        
-        bar = tqdm(range(num_train_optimization_steps),total=num_train_optimization_steps)
-        train_dataloader=cycle(train_dataloader)
+        nb_tr_examples, nb_tr_steps = 0, 0
+        bar = tqdm(range(num_train_optimization_steps), total=num_train_optimization_steps)
+        train_dataloader = cycle(train_dataloader)
 
-#        weights = []
-#        for w in open("./weight_3_segment.weight","r",encoding='utf-8').read().split('\n'):
-#            if len(w.split(','))!=3:
-#                print(w)
-#                continue
-#            w = [float(x) for x in w.split(',')]
-#            weights.append(w)
+        #        weights = []
+        #        for w in open("./weight_3_segment.weight","r",encoding='utf-8').read().split('\n'):
+        #            if len(w.split(','))!=3:
+        #                print(w)
+        #                continue
+        #            w = [float(x) for x in w.split(',')]
+        #            weights.append(w)
         stop_gate = 0
         for step in bar:
             batch = next(train_dataloader)
             batch = tuple(t.to(device) for t in batch)
             input_ids, input_mask, segment_ids, label_ids, weight_ids = batch
-            loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=label_ids, weight_ids = weight_ids)
+            loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=label_ids, weight_ids=weight_ids)
             if args.n_gpu > 1:
-                loss = loss.mean() # mean() to average on multi-gpu.
+                loss = loss.mean()  # mean() to average on multi-gpu.
             if args.fp16 and args.loss_scale != 1.0:
                 loss = loss * args.loss_scale
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
             tr_loss += loss.item()
-            train_loss=round(tr_loss*args.gradient_accumulation_steps/(nb_tr_steps+1),4)
+            train_loss = round(tr_loss * args.gradient_accumulation_steps / (nb_tr_steps + 1), 4)
             bar.set_description("loss {}".format(train_loss))
             nb_tr_examples += input_ids.size(0)
             nb_tr_steps += 1
@@ -517,45 +480,42 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
-
-            if (step + 1) %(args.eval_steps*args.gradient_accumulation_steps)==0:
+            if (step + 1) % (args.eval_steps * args.gradient_accumulation_steps) == 0:
                 tr_loss = 0
-                nb_tr_examples, nb_tr_steps = 0, 0 
+                nb_tr_examples, nb_tr_steps = 0, 0
                 logger.info("***** Report result *****")
                 logger.info("  %s = %s", 'global_step', str(global_step))
                 logger.info("  %s = %s", 'train loss', str(train_loss))
 
-
-            if args.do_eval and (step + 1) %(args.eval_steps*args.gradient_accumulation_steps)==0:
+            if args.do_eval and (step + 1) % (args.eval_steps * args.gradient_accumulation_steps) == 0:
                 for file in ['dev.csv']:
-                    inference_labels=[]
-                    gold_labels=[]
-                    inference_logits=[]
-                    eval_examples = read_examples(os.path.join(args.data_dir, file), is_training = True)
-                    eval_features = convert_examples_to_features(eval_examples, tokenizer, args.max_seq_length,args.split_num,False)
+                    inference_labels = []
+                    gold_labels = []
+                    inference_logits = []
+                    eval_examples = read_examples(os.path.join(args.data_dir, file), is_training=True)
+                    eval_features = convert_examples_to_features(eval_examples, tokenizer, args.max_seq_length, args.split_num, False)
                     all_input_ids = torch.tensor(select_field(eval_features, 'input_ids'), dtype=torch.long)
                     all_input_mask = torch.tensor(select_field(eval_features, 'input_mask'), dtype=torch.long)
                     all_segment_ids = torch.tensor(select_field(eval_features, 'segment_ids'), dtype=torch.long)
-                    all_label = torch.tensor([f.label for f in eval_features], dtype=torch.long)                   
-                    for i,f in enumerate(eval_features):
-                        if i==0:
+                    all_label = torch.tensor([f.label for f in eval_features], dtype=torch.long)
+                    for i, f in enumerate(eval_features):
+                        if i == 0:
                             all_weight = f.weight.unsqueeze(0)
                         else:
                             all_weight = torch.cat([all_weight, f.weight.unsqueeze(0)])
 
+                    eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label, all_weight)
 
-                    eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label,all_weight)
-                        
                     logger.info("***** Running evaluation *****")
                     logger.info("  Num examples = %d", len(eval_examples))
-                    logger.info("  Batch size = %d", args.eval_batch_size)  
-                        
+                    logger.info("  Batch size = %d", args.eval_batch_size)
+
                     # Run prediction for full data
                     eval_sampler = SequentialSampler(eval_data)
                     eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
                     model.eval()
-                    eval_loss, eval_f1, eval_acc, eval_recall,eval_precision = 0, 0, 0, 0, 0
+                    eval_loss, eval_f1, eval_acc, eval_recall, eval_precision = 0, 0, 0, 0, 0
                     nb_eval_steps, nb_eval_examples = 0, 0
                     for input_ids, input_mask, segment_ids, label_ids, weight_ids in eval_dataloader:
                         input_ids = input_ids.to(device)
@@ -564,10 +524,10 @@ def main():
                         label_ids = label_ids.to(device)
                         weight_ids = weight_ids.to(device)
 
-
                         with torch.no_grad():
-                            tmp_eval_loss= model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=label_ids, weight_ids = weight_ids)
-                            logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, weight_ids = weight_ids)
+                            tmp_eval_loss = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=label_ids,
+                                                  weight_ids=weight_ids)
+                            logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, weight_ids=weight_ids)
 
                         logits = logits.detach().cpu().numpy()
                         label_ids = label_ids.to('cpu').numpy()
@@ -577,9 +537,9 @@ def main():
                         eval_loss += tmp_eval_loss.mean().item()
                         nb_eval_examples += input_ids.size(0)
                         nb_eval_steps += 1
-                        
-                    gold_labels=np.concatenate(gold_labels,0) 
-                    inference_logits=np.concatenate(inference_logits,0)
+
+                    gold_labels = np.concatenate(gold_labels, 0)
+                    inference_logits = np.concatenate(inference_logits, 0)
                     model.train()
                     eval_loss = eval_loss / nb_eval_steps
                     eval_f1 = f1(inference_logits, gold_labels)
@@ -600,34 +560,33 @@ def main():
                         for key in sorted(result.keys()):
                             logger.info("  %s = %s", key, str(result[key]))
                             writer.write("%s = %s\n" % (key, str(result[key])))
-                        writer.write('*'*80)
+                        writer.write('*' * 80)
                         writer.write('\n')
                     if abs(eval_f1 - best_acc) < 0.05 and eval_f1 < best_acc and 'dev' in file:
-                        stop_gate += 1 
+                        stop_gate += 1
                     if eval_f1 > best_acc and 'dev' in file:
-                        print("="*80)
-                        print("Best F1",eval_f1)
-                        print("Accuracy",eval_acc)
+                        print("=" * 80)
+                        print("Best F1", eval_f1)
+                        print("Accuracy", eval_acc)
                         print("Saving Model......")
-                        best_acc=eval_f1
-                        stop_gate=0
+                        best_acc = eval_f1
+                        stop_gate = 0
                         # Save a trained model
                         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
                         output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
                         torch.save(model_to_save.state_dict(), output_model_file)
-                        print("="*80)
+                        print("=" * 80)
                     else:
-                        print("="*80)
-            if stop_gate >= 10 and global_step > num_train_optimization_steps*0.6:
+                        print("=" * 80)
+            if stop_gate >= 10 and global_step > num_train_optimization_steps * 0.6:
                 print("Early Stopping. Bye~")
                 break
 
-   
     if args.do_test:
         del model
         gc.collect()
-        args.do_train=False
-        model = BertForSequenceClassification.from_pretrained(os.path.join(args.output_dir, "pytorch_model.bin"),args,config=config)
+        args.do_train = False
+        model = BertForSequenceClassification.from_pretrained(os.path.join(args.output_dir, "pytorch_model.bin"), args, config=config)
         if args.fp16:
             model.half()
         model.to(device)
@@ -639,23 +598,23 @@ def main():
 
             model = DDP(model)
         elif args.n_gpu > 1:
-            model = torch.nn.DataParallel(model)        
-        
+            model = torch.nn.DataParallel(model)
+
         if not os.path.exists(args.wf_data_dir):
-            os.makedirs(args.wf_data_dir) 
-        for file,flag in [('train.csv','train'),('dev.csv','dev'),('test.csv','dev')]:
+            os.makedirs(args.wf_data_dir)
+        for file, flag in [('train.csv', 'train'), ('dev.csv', 'dev'), ('test.csv', 'dev')]:
             rewards = []
-            inference_labels=[]
-            gold_labels=[]
-            eval_examples = read_examples(os.path.join(args.data_dir, file), is_training = False)
-            eval_features = convert_examples_to_features(eval_examples, tokenizer, args.max_seq_length,args.split_num,False)
+            inference_labels = []
+            gold_labels = []
+            eval_examples = read_examples(os.path.join(args.data_dir, file), is_training=False)
+            eval_features = convert_examples_to_features(eval_examples, tokenizer, args.max_seq_length, args.split_num, False)
             all_input_ids = torch.tensor(select_field(eval_features, 'input_ids'), dtype=torch.long)
             all_input_mask = torch.tensor(select_field(eval_features, 'input_mask'), dtype=torch.long)
             all_segment_ids = torch.tensor(select_field(eval_features, 'segment_ids'), dtype=torch.long)
-            all_label = torch.tensor([f.label for f in eval_features], dtype=torch.long)                           
+            all_label = torch.tensor([f.label for f in eval_features], dtype=torch.long)
 
             all_title_len = torch.tensor([f.title_len for f in eval_features], dtype=torch.long)
-            eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,all_label,all_title_len)
+            eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label, all_title_len)
             # Run prediction for full data
             eval_sampler = SequentialSampler(eval_data)
             eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
@@ -663,7 +622,7 @@ def main():
             model.eval()
             eval_loss, eval_accuracy = 0, 0
             nb_eval_steps, nb_eval_examples = 0, 0
-            for input_ids, input_mask, segment_ids, label_ids,title_lens in eval_dataloader:
+            for input_ids, input_mask, segment_ids, label_ids, title_lens in eval_dataloader:
                 input_ids = input_ids.to(device)
                 input_mask = input_mask.to(device)
                 segment_ids = segment_ids.to(device)
@@ -675,27 +634,25 @@ def main():
                 label_ids = label_ids.to('cpu').numpy()
                 inference_labels.append(logits)
                 gold_labels.append(label_ids)
-            gold_labels=np.concatenate(gold_labels,0)
-            logits=np.concatenate(inference_labels,0)
+            gold_labels = np.concatenate(gold_labels, 0)
+            logits = np.concatenate(inference_labels, 0)
 
             for i in range(gold_labels.shape[0]):
-                #rewards.append(logits[i,gold_labels[i]])
                 rewards.append(logits[i].tolist())
-#            print(logits)
-#            print(gold_labels)
             df = pd.read_csv(os.path.join(args.data_dir, file))
             if len(rewards) != len(df):
                 print("Error in length of rewards")
             print(len(rewards), len(df), gold_labels.shape)
-            df['reward_1'] = rewards
-            df[['id','new_content','title','label','weight','reward_1']].to_csv(os.path.join(args.wf_data_dir, file),index = False)
-            print("write to ",os.path.join(args.wf_data_dir, file))
-            if flag=='test':
-                df=pd.read_csv(os.path.join(args.data_dir, file))
-                df['label_0']=logits[:,0]
-                df['label_1']=logits[:,1]
-                df['label_2']=logits[:,2]
-                df[['id','label_0','label_1','label_2']].to_csv(os.path.join(args.output_dir, "sub.csv"),index=False)
-            
+            df['reward'] = rewards
+            df[['id', 'new_content', 'title', 'label', 'weight', 'reward']].to_csv(os.path.join(args.wf_data_dir, file), index=False)
+            print("write to ", os.path.join(args.wf_data_dir, file))
+            if flag == 'test':
+                df = pd.read_csv(os.path.join(args.data_dir, file))
+                df['label_0'] = logits[:, 0]
+                df['label_1'] = logits[:, 1]
+                df['label_2'] = logits[:, 2]
+                df[['id', 'label_0', 'label_1', 'label_2']].to_csv(os.path.join(args.output_dir, "sub.csv"), index=False)
+
+
 if __name__ == "__main__":
     main()
